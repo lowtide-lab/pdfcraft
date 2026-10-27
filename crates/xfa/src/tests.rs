@@ -4089,3 +4089,30 @@ fn clear_password_values_clears_static_xfa_password_fields() {
     let packets = read_packets(&doc).unwrap().unwrap();
     assert!(!packets.xdp.contains("hunter2"), "{}", packets.xdp);
 }
+
+#[test]
+fn fields_by_som_reads_a_field_listed_many_times_once() {
+    // A field lists itself twice and its one widget twice: walked once per path to it, that is
+    // 2^64 visits at the depth limit.
+    let s = |t: &str| Object::String(pdfcraft_cos::PdfString::literal(t));
+    let mut doc = Document::new_empty();
+    let mut widget = Dict::new();
+    widget.set(b"T".to_vec(), s("name"));
+    widget.set(crate::pdf::SOM_KEY.to_vec(), s("form1[0].name[0]"));
+    let widget = Object::Ref(doc.add(Object::Dict(widget)));
+    let parent = doc.add(Object::Null);
+    let mut d = Dict::new();
+    d.set(b"T".to_vec(), s("form1"));
+    d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(parent), widget.clone(), Object::Ref(parent), widget]));
+    doc.set(parent, Object::Dict(d));
+    let mut acro = Dict::new();
+    acro.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(parent)]));
+    let mut cat = Dict::new();
+    cat.set(b"Type".to_vec(), Object::Name(b"Catalog".to_vec()));
+    cat.set(b"AcroForm".to_vec(), Object::Dict(acro));
+    let cat = doc.add(Object::Dict(cat));
+    doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat));
+    let by_som = fields_by_som(&doc);
+    assert_eq!(by_som.len(), 1, "{by_som:?}");
+    assert_eq!(by_som.get("form1[0].name[0]").map(String::as_str), Some("form1.name"));
+}

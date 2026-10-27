@@ -2,7 +2,7 @@
 //! events a template declares, the presence overrides scripts make (kept in the PDF so they
 //! survive undo and reopening), and laying the form out again after scripts changed it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, Object, PdfString};
 
@@ -15,6 +15,8 @@ pub const OVERRIDES_KEY: &[u8] = b"PCXfaOverrides";
 
 const MAX_DEPTH: usize = 64;
 const MAX_EVENTS: usize = 20_000;
+/// Most `/Kids` entries [`fields_by_som`] follows in all, fields already read included.
+const MAX_FIELD_STEPS: usize = 1 << 20;
 /// Most bytes of script the events hold together: each instance of a repeated subform holds its
 /// own copy, so a long script repeated many times stops here (as much as the XFA packets hold).
 pub(crate) const MAX_EVENT_SCRIPT_BYTES: usize = 64 << 20;
@@ -543,8 +545,17 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
 
 /// The generated fields of the AcroForm by SOM path: `som → (field name, is a radio group)`.
 pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
-    fn walk(doc: &Document, r: pdfcraft_cos::ObjRef, prefix: &str, out: &mut HashMap<String, String>, depth: usize) {
-        if depth > MAX_DEPTH || out.len() > 100_000 {
+    // Each field is read once: a field listed twice in `/Kids` (or among its own kids) would
+    // otherwise be walked again for every path to it, doubling the work at each level. `steps`
+    // counts every entry followed, so fields sharing one long `/Kids` array stay bounded too.
+    struct Walk {
+        out: HashMap<String, String>,
+        seen: HashSet<pdfcraft_cos::ObjRef>,
+        steps: usize,
+    }
+    fn walk(doc: &Document, r: pdfcraft_cos::ObjRef, prefix: &str, w: &mut Walk, depth: usize) {
+        w.steps += 1;
+        if depth > MAX_DEPTH || w.out.len() > 100_000 || w.steps > MAX_FIELD_STEPS || !w.seen.insert(r) {
             return;
         }
         let o = doc.get(r);
@@ -558,21 +569,21 @@ pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
         if let Some(som) = d.get(crate::pdf::SOM_KEY).map(|s| doc.resolve(s)).and_then(|s| s.as_string().map(|s| s.to_text()))
             && t.is_some()
         {
-            out.insert(som, name.clone());
+            w.out.insert(som, name.clone());
         }
         if let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()) {
             for k in kids.iter().filter_map(Object::as_ref) {
-                walk(doc, k, &name, out, depth + 1);
+                walk(doc, k, &name, w, depth + 1);
             }
         }
     }
-    let mut out = HashMap::new();
-    let Some((_, acro)) = acroform(doc) else { return out };
+    let Some((_, acro)) = acroform(doc) else { return HashMap::new() };
     let fields = acro.get(b"Fields").map(|f| doc.resolve(f)).and_then(|f| f.as_array().cloned()).unwrap_or_default();
+    let mut w = Walk { out: HashMap::new(), seen: HashSet::new(), steps: 0 };
     for f in fields.iter().filter_map(Object::as_ref) {
-        walk(doc, f, "", &mut out, 0);
+        walk(doc, f, "", &mut w, 0);
     }
-    out
+    w.out
 }
 
 /// Lay the form out again from its template, data and overrides, replacing the pages and the

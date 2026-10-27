@@ -90,7 +90,7 @@ struct Signed {
     appearance: Option<Object>,
 }
 
-/// Most fields looked at for signatures.
+/// Most fields looked at for signatures, counted as they are queued.
 const MAX_FIELDS_SEARCHED: usize = 20_000;
 /// Deepest field nesting followed.
 const MAX_FIELD_DEPTH: usize = 32;
@@ -105,21 +105,29 @@ fn existing_fields(doc: &Document, catalog: &Dict) -> (HashMap<String, Signed>, 
     let mut names = HashSet::new();
     let Some(acro) = catalog.get(b"AcroForm").map(|a| doc.resolve(a)) else { return (out, names) };
     let Some(fields) = acro.as_dict().and_then(|a| a.get(b"Fields")).map(|f| doc.resolve(f)) else { return (out, names) };
+    // Counted as queued, not as visited: a field listing one kid many times (or itself) would
+    // otherwise queue them all on every visit, far past the limit, before the count stopped it.
     let mut stack: Vec<(Object, String, bool, usize)> =
-        fields.as_array().into_iter().flatten().map(|f| (f.clone(), String::new(), false, 0)).collect();
-    let mut seen = 0usize;
+        fields.as_array().into_iter().flatten().take(MAX_FIELDS_SEARCHED).map(|f| (f.clone(), String::new(), false, 0)).collect();
+    let mut queued = stack.len();
+    // And each field is read once, however many times it is listed.
+    let mut seen = HashSet::new();
     while let Some((field, prefix, parent_is_sig, depth)) = stack.pop() {
-        seen += 1;
-        if seen > MAX_FIELDS_SEARCHED {
-            break;
+        if let Object::Ref(r) = field
+            && !seen.insert(r)
+        {
+            continue;
         }
         let field = doc.resolve(&field);
         let Some(d) = field.as_dict() else { continue };
         if d.contains(NODE_KEY) {
             // Generated to name a signature field: only what it holds is looked at.
             if depth < MAX_FIELD_DEPTH {
-                let kids = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default();
-                stack.extend(kids.into_iter().map(|k| (k, String::new(), false, depth + 1)));
+                let kids = d.get(b"Kids").map(|k| doc.resolve(k));
+                let kids = kids.as_deref().and_then(Object::as_array).map(Vec::as_slice).unwrap_or_default();
+                let room = MAX_FIELDS_SEARCHED.saturating_sub(queued);
+                queued += kids.len().min(room);
+                stack.extend(kids.iter().take(room).map(|k| (k.clone(), String::new(), false, depth + 1)));
             }
             continue;
         }
@@ -145,14 +153,17 @@ fn existing_fields(doc: &Document, catalog: &Dict) -> (HashMap<String, Signed>, 
             Some(ft) => ft == b"Sig",
             None => parent_is_sig,
         };
-        let kids: Vec<Object> = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default();
+        let kids = d.get(b"Kids").map(|k| doc.resolve(k));
+        let kids = kids.as_deref().and_then(Object::as_array).map(Vec::as_slice).unwrap_or_default();
         if is_sig && let Some(value) = d.get(b"V").filter(|v| doc.resolve(v).as_dict().is_some()) {
             // The appearance is on the field when it is its own widget, or on its one widget.
             let appearance = d.get(b"AP").cloned().or_else(|| kids.iter().find_map(|k| doc.resolve(k).as_dict().and_then(|k| k.get(b"AP").cloned())));
             out.entry(name.clone()).or_insert(Signed { value: value.clone(), appearance });
         }
         if depth < MAX_FIELD_DEPTH {
-            stack.extend(kids.into_iter().map(|k| (k, name.clone(), is_sig, depth + 1)));
+            let room = MAX_FIELDS_SEARCHED.saturating_sub(queued);
+            queued += kids.len().min(room);
+            stack.extend(kids.iter().take(room).map(|k| (k.clone(), name.clone(), is_sig, depth + 1)));
         }
     }
     (out, names)
@@ -961,7 +972,49 @@ pub fn pdf_rect(r: Rect, page_height: f64) -> [f64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hex32;
+    use pdfcraft_cos::{Dict, Document, Object, PdfString};
+
+    use super::{MAX_FIELDS_SEARCHED, existing_fields, parse_hex32};
+
+    /// The fields `existing_fields` finds under an AcroForm listing `fields`.
+    fn names_found(doc: &Document, fields: Vec<Object>) -> Vec<String> {
+        let mut acro = Dict::new();
+        acro.set(b"Fields".to_vec(), Object::Array(fields));
+        let mut catalog = Dict::new();
+        catalog.set(b"AcroForm".to_vec(), Object::Dict(acro));
+        let (signed, names) = existing_fields(doc, &catalog);
+        assert!(signed.is_empty());
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        names
+    }
+
+    fn field(name: &str, kids: Object) -> Object {
+        let mut d = Dict::new();
+        d.set(b"T".to_vec(), Object::String(PdfString::literal(name)));
+        d.set(b"Kids".to_vec(), kids);
+        Object::Dict(d)
+    }
+
+    #[test]
+    fn fields_listed_many_times_queue_a_bounded_number_of_kids() {
+        // A field lists itself 5,000 times: queuing every kid on each of 20,000 visits would
+        // hold a hundred million entries. It is read once.
+        let mut doc = Document::new_empty();
+        let r = doc.add(Object::Null);
+        doc.set(r, field("a", Object::Array(vec![Object::Ref(r); 5_000])));
+        assert_eq!(names_found(&doc, vec![Object::Ref(r)]), ["a"]);
+
+        // 5,000 fields share one /Kids array listing each of them 200 times. Read once each,
+        // the fields down one branch still queue the whole array at every level: 32 million
+        // entries, unless the queue itself is bounded.
+        let mut doc = Document::new_empty();
+        let kids = doc.add(Object::Null);
+        let fields: Vec<Object> = (0..5_000).map(|i| Object::Ref(doc.add(field(&format!("f{i}"), Object::Ref(kids))))).collect();
+        doc.set(kids, Object::Array(fields.iter().cycle().take(1_000_000).cloned().collect()));
+        let names = names_found(&doc, fields[..1].to_vec());
+        assert!(names.contains(&"f0".to_string()) && names.len() <= MAX_FIELDS_SEARCHED, "{} names", names.len());
+    }
 
     #[test]
     fn parse_hex32_rejects_non_hex_digits() {
