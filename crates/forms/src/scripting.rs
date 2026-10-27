@@ -169,6 +169,9 @@ pub fn document_scripts(doc: &Document) -> Vec<String> {
     document_scripts_named(doc).into_iter().map(|(_, js)| js).collect()
 }
 
+/// Most `/Kids` entries the document JavaScript name tree walk queues in all.
+const MAX_QUEUED_KIDS: usize = 1 << 20;
+
 /// [`document_scripts`] with their names.
 pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
     let Some(root) = doc.root() else { return Vec::new() };
@@ -182,6 +185,9 @@ pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
     let mut stack = vec![tree];
     let mut seen: HashSet<ObjRef> = HashSet::new();
     let mut visited = 0;
+    // Every `/Kids` entry queued, over the whole walk. Nodes sharing one long `/Kids` array would
+    // otherwise queue all of it once per node, the seen check only skipping the copies later.
+    let mut queued = 0usize;
     while let Some(raw) = stack.pop() {
         if let Object::Ref(r) = raw
             && !seen.insert(r)
@@ -194,8 +200,16 @@ pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
         }
         let node = doc.resolve(&raw);
         let Some(d) = node.as_dict() else { continue };
-        if let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()) {
-            stack.extend(kids);
+        if let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k))
+            && let Some(kids) = kids.as_array()
+        {
+            queued = queued.saturating_add(kids.len());
+            if queued > MAX_QUEUED_KIDS {
+                // This node's own names are still read; nothing more is queued or visited.
+                stack.clear();
+            } else {
+                stack.extend(kids.iter().cloned());
+            }
         }
         if let Some(pairs) = d.get(b"Names").map(|n| doc.resolve(n)).and_then(|n| n.as_array().cloned()) {
             for pair in pairs.chunks(2) {
