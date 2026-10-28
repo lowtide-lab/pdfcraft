@@ -3213,6 +3213,32 @@ fn name_tree_nodes_sharing_one_long_kids_array_queue_it_a_bounded_number_of_time
     assert_eq!(document_scripts_named(&doc), [("init".to_string(), "var ready = true;".to_string())]);
 }
 
+#[test]
+fn a_direct_object_in_a_shared_kids_array_is_not_copied_for_every_node() {
+    // 1,000 nodes share one /Kids array that also holds a direct dictionary with a 2 MiB
+    // string. Queued with every node's kids, it would be copied 1,000 times (2 GiB) while the
+    // entry count stayed under its limit. Kids are references, so it is skipped.
+    let dict = |entries: Vec<(&[u8], Object)>| -> Object { Object::Dict(entries.into_iter().map(|(k, v)| (k.to_vec(), v)).collect()) };
+    let mut doc = Document::new_empty();
+    let action = doc.add(dict(vec![
+        (b"S", Object::Name(b"JavaScript".to_vec())),
+        (b"JS", Object::String(pdfcraft_cos::PdfString::literal("var ready = true;"))),
+    ]));
+    let leaf = doc.add(dict(vec![(b"Names", Object::Array(vec![Object::String(pdfcraft_cos::PdfString::literal("init")), Object::Ref(action)]))]));
+    let kids = doc.add(Object::Null);
+    let big = dict(vec![(b"Pad", Object::String(pdfcraft_cos::PdfString::literal("x".repeat(2 << 20))))]);
+    let mut shared = vec![big];
+    shared.extend((0..1_000).map(|_| Object::Ref(doc.add(dict(vec![(b"Kids", Object::Ref(kids))])))));
+    shared.push(Object::Ref(leaf));
+    doc.set(kids, Object::Array(shared));
+    let catalog = doc.add(dict(vec![
+        (b"Type", Object::Name(b"Catalog".to_vec())),
+        (b"Names", dict(vec![(b"JavaScript", dict(vec![(b"Kids", Object::Ref(kids))]))])),
+    ]));
+    doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(catalog));
+    assert_eq!(document_scripts_named(&doc), [("init".to_string(), "var ready = true;".to_string())]);
+}
+
 /// #3470: a form whose writer left the appearances to the viewer. Field A has an empty one,
 /// B none, C its own (`(old C)`), D is a combo without one, E a check box with states, F a list
 /// box without one, and G only a down appearance (`/D`, no `/N`).

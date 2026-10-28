@@ -169,7 +169,7 @@ pub fn document_scripts(doc: &Document) -> Vec<String> {
     document_scripts_named(doc).into_iter().map(|(_, js)| js).collect()
 }
 
-/// Most `/Kids` entries the document JavaScript name tree walk queues in all.
+/// Most `/Kids` entries the document JavaScript name tree walk reads in all.
 const MAX_QUEUED_KIDS: usize = 1 << 20;
 
 /// [`document_scripts`] with their names.
@@ -180,20 +180,17 @@ pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
     let Some(tree) = names.as_dict().and_then(|n| n.get(b"JavaScript")).cloned() else { return Vec::new() };
     let mut out: Vec<(String, String)> = Vec::new();
     let mut scripts = crate::script_budget();
-    // Kids stay unresolved on the stack, and each node is read once: a node listed many times,
-    // or among its own kids, must not multiply the work.
+    // Kids are indirect references (ISO 32000-2 §7.9.6), queued unresolved, each the first time
+    // it is listed: a node listed many times, or among its own kids, must not multiply the work,
+    // and the stack holds only references (a direct object there would be copied whole, once
+    // for every node listing it). Only the root may be direct.
+    let mut seen: HashSet<ObjRef> = tree.as_ref().into_iter().collect();
     let mut stack = vec![tree];
-    let mut seen: HashSet<ObjRef> = HashSet::new();
     let mut visited = 0;
-    // Every `/Kids` entry queued, over the whole walk. Nodes sharing one long `/Kids` array would
-    // otherwise queue all of it once per node, the seen check only skipping the copies later.
+    // Every `/Kids` entry read, over the whole walk. Nodes sharing one long `/Kids` array would
+    // otherwise read all of it once per node.
     let mut queued = 0usize;
     while let Some(raw) = stack.pop() {
-        if let Object::Ref(r) = raw
-            && !seen.insert(r)
-        {
-            continue;
-        }
         visited += 1;
         if visited > 10_000 {
             break;
@@ -203,13 +200,12 @@ pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
         if let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k))
             && let Some(kids) = kids.as_array()
         {
-            queued = queued.saturating_add(kids.len());
-            if queued > MAX_QUEUED_KIDS {
-                // This node's own names are still read; nothing more is queued or visited.
-                stack.clear();
-            } else {
-                stack.extend(kids.iter().cloned());
-            }
+            // Past the limit nothing more is read, but the nodes already queued still are. Pushed
+            // in reverse, so the kids are read in the order listed.
+            let room = MAX_QUEUED_KIDS.saturating_sub(queued);
+            queued = queued.saturating_add(kids.len().min(room));
+            let new: Vec<Object> = kids.iter().take(room).filter_map(Object::as_ref).filter(|r| seen.insert(*r)).map(Object::Ref).collect();
+            stack.extend(new.into_iter().rev());
         }
         if let Some(pairs) = d.get(b"Names").map(|n| doc.resolve(n)).and_then(|n| n.as_array().cloned()) {
             for pair in pairs.chunks(2) {
