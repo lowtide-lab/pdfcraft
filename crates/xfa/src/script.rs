@@ -547,19 +547,23 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
 pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
     // Each field is read once: a field listed twice in `/Kids` (or among its own kids) would
     // otherwise be walked again for every path to it, doubling the work at each level. `steps`
-    // counts every entry followed, so fields sharing one long `/Kids` array stay bounded too.
+    // counts every entry followed, so fields sharing one long `/Kids` array stay bounded too;
+    // `walk` returns false once it is spent, and every loop then stops.
     struct Walk {
         out: HashMap<String, String>,
         seen: HashSet<pdfcraft_cos::ObjRef>,
         steps: usize,
     }
-    fn walk(doc: &Document, r: pdfcraft_cos::ObjRef, prefix: &str, w: &mut Walk, depth: usize) {
+    fn walk(doc: &Document, r: pdfcraft_cos::ObjRef, prefix: &str, w: &mut Walk, depth: usize) -> bool {
         w.steps += 1;
-        if depth > MAX_DEPTH || w.out.len() > 100_000 || w.steps > MAX_FIELD_STEPS || !w.seen.insert(r) {
-            return;
+        if w.steps > MAX_FIELD_STEPS || w.out.len() > 100_000 {
+            return false;
+        }
+        if depth > MAX_DEPTH || !w.seen.insert(r) {
+            return true;
         }
         let o = doc.get(r);
-        let Some(d) = o.as_dict() else { return };
+        let Some(d) = o.as_dict() else { return true };
         let t = d.get(b"T").map(|t| doc.resolve(t)).and_then(|t| t.as_string().map(|s| s.to_text()));
         let name = match (&t, prefix.is_empty()) {
             (Some(t), true) => t.clone(),
@@ -571,18 +575,14 @@ pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
         {
             w.out.insert(som, name.clone());
         }
-        if let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()) {
-            for k in kids.iter().filter_map(Object::as_ref) {
-                walk(doc, k, &name, w, depth + 1);
-            }
-        }
+        // Read in place: a copy of the array at every level would cost its length each time.
+        let kids = d.get(b"Kids").map(|k| doc.resolve(k));
+        kids.as_deref().and_then(Object::as_array).into_iter().flatten().filter_map(Object::as_ref).all(|k| walk(doc, k, &name, w, depth + 1))
     }
     let Some((_, acro)) = acroform(doc) else { return HashMap::new() };
-    let fields = acro.get(b"Fields").map(|f| doc.resolve(f)).and_then(|f| f.as_array().cloned()).unwrap_or_default();
+    let fields = acro.get(b"Fields").map(|f| doc.resolve(f));
     let mut w = Walk { out: HashMap::new(), seen: HashSet::new(), steps: 0 };
-    for f in fields.iter().filter_map(Object::as_ref) {
-        walk(doc, f, "", &mut w, 0);
-    }
+    let _ = fields.as_deref().and_then(Object::as_array).into_iter().flatten().filter_map(Object::as_ref).all(|f| walk(doc, f, "", &mut w, 0));
     w.out
 }
 
