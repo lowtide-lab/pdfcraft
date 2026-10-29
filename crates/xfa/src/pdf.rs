@@ -161,17 +161,19 @@ fn existing_fields(doc: &Document, catalog: &Dict) -> (HashMap<String, Signed>, 
 #[derive(Default)]
 struct FieldQueue {
     stack: Vec<(ObjRef, String, bool, usize)>,
-    seen: HashSet<ObjRef>,
+    /// Object numbers queued: [`Document::get`] finds a field by number alone, so `5 0 R` and
+    /// `5 1 R` are the same field.
+    seen: HashSet<u32>,
     read: usize,
 }
 
 impl FieldQueue {
     /// Queue the fields `kids` lists, each the first time it is listed. Fields and kids are
     /// indirect references (ISO 32000-2 §12.7.3.1); anything else is skipped. A field listed
-    /// again, by this list or another, takes no room, and at most [`MAX_FIELDS_SEARCHED`] are
-    /// ever queued: a field listing one kid many times, or fields sharing one long `/Kids`, would
-    /// otherwise queue it all on every visit. Reading the repeats costs too, so at most
-    /// [`MAX_KIDS_READ`] entries are read in all.
+    /// again, by this list or another, under any generation, takes no room, and at most
+    /// [`MAX_FIELDS_SEARCHED`] are ever queued: a field listing one kid many times, or fields
+    /// sharing one long `/Kids`, would otherwise queue it all on every visit. Reading the repeats
+    /// costs too, so at most [`MAX_KIDS_READ`] entries are read in all.
     fn queue(&mut self, kids: &[Object], prefix: &str, is_sig: bool, depth: usize) {
         for k in kids {
             self.read += 1;
@@ -179,7 +181,7 @@ impl FieldQueue {
                 return;
             }
             let Some(r) = k.as_ref() else { continue };
-            if self.seen.insert(r) {
+            if self.seen.insert(r.num) {
                 self.stack.push((r, prefix.to_string(), is_sig, depth));
             }
         }
@@ -989,17 +991,15 @@ pub fn pdf_rect(r: Rect, page_height: f64) -> [f64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use pdfcraft_cos::{Dict, Document, Object, PdfString};
+    use std::collections::{HashMap, HashSet};
 
-    use super::{MAX_FIELDS_SEARCHED, existing_fields, parse_hex32};
+    use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
+
+    use super::{MAX_FIELDS_SEARCHED, Signed, existing_fields, parse_hex32};
 
     /// The fields `existing_fields` finds under an AcroForm listing `fields`.
     fn names_found(doc: &Document, fields: Vec<Object>) -> Vec<String> {
-        let mut acro = Dict::new();
-        acro.set(b"Fields".to_vec(), Object::Array(fields));
-        let mut catalog = Dict::new();
-        catalog.set(b"AcroForm".to_vec(), Object::Dict(acro));
-        let (signed, names) = existing_fields(doc, &catalog);
+        let (signed, names) = existing(doc, fields);
         assert!(signed.is_empty());
         let mut names: Vec<String> = names.into_iter().collect();
         names.sort();
@@ -1038,20 +1038,43 @@ mod tests {
         // The AcroForm lists one field 19,999 times. The copies take no room, so its kids are
         // still queued, and the signed one among them is found.
         let mut doc = Document::new_empty();
+        let parent = signed_parent(&mut doc);
+        let (signed, names) = existing(&doc, vec![Object::Ref(parent); MAX_FIELDS_SEARCHED - 1]);
+        assert!(signed.contains_key("c.sig"), "{:?}", signed.keys().collect::<Vec<_>>());
+        assert!(names.contains("c.plain"));
+    }
+
+    #[test]
+    fn a_field_listed_under_many_generations_is_queued_once() {
+        // `Document::get` finds a field by object number alone, so `5 0 R` and `5 1 R` are one
+        // field. Listed 19,999 times, each under another generation, it is still queued once,
+        // and the signed field under it is found.
+        let mut doc = Document::new_empty();
+        let parent = signed_parent(&mut doc);
+        let fields = (0..MAX_FIELDS_SEARCHED - 1).map(|g| Object::Ref(ObjRef::new(parent.num, u16::try_from(g).unwrap()))).collect();
+        let (signed, names) = existing(&doc, fields);
+        assert!(signed.contains_key("c.sig"), "{:?}", signed.keys().collect::<Vec<_>>());
+        assert!(names.contains("c.plain"));
+    }
+
+    /// Field `c` with two kids: `plain`, and `sig`, a signed signature field.
+    fn signed_parent(doc: &mut Document) -> ObjRef {
         let plain = doc.add(field("plain", Object::Array(Vec::new())));
         let mut sig = Dict::new();
         sig.set(b"T".to_vec(), Object::String(PdfString::literal("sig")));
         sig.set(b"FT".to_vec(), Object::Name(b"Sig".to_vec()));
         sig.set(b"V".to_vec(), Object::Dict(Dict::new()));
         let sig = doc.add(Object::Dict(sig));
-        let parent = doc.add(field("c", Object::Array(vec![Object::Ref(plain), Object::Ref(sig)])));
+        doc.add(field("c", Object::Array(vec![Object::Ref(plain), Object::Ref(sig)])))
+    }
+
+    /// What `existing_fields` finds under an AcroForm listing `fields`.
+    fn existing(doc: &Document, fields: Vec<Object>) -> (HashMap<String, Signed>, HashSet<String>) {
         let mut acro = Dict::new();
-        acro.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(parent); MAX_FIELDS_SEARCHED - 1]));
+        acro.set(b"Fields".to_vec(), Object::Array(fields));
         let mut catalog = Dict::new();
         catalog.set(b"AcroForm".to_vec(), Object::Dict(acro));
-        let (signed, names) = existing_fields(&doc, &catalog);
-        assert!(signed.contains_key("c.sig"), "{:?}", signed.keys().collect::<Vec<_>>());
-        assert!(names.contains("c.plain"));
+        existing_fields(doc, &catalog)
     }
 
     #[test]

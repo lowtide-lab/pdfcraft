@@ -15,7 +15,8 @@ pub const OVERRIDES_KEY: &[u8] = b"PCXfaOverrides";
 
 const MAX_DEPTH: usize = 64;
 const MAX_EVENTS: usize = 20_000;
-/// Most `/Kids` entries [`fields_by_som`] follows in all, fields already read included.
+/// Most `/Fields` and `/Kids` entries [`fields_by_som`] looks at in all: fields already read, and
+/// entries that are not references, included.
 const MAX_FIELD_STEPS: usize = 1 << 20;
 /// Most bytes of script the events hold together: each instance of a repeated subform holds its
 /// own copy, so a long script repeated many times stops here (as much as the XFA packets hold).
@@ -546,20 +547,27 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
 /// The generated fields of the AcroForm by SOM path: `som → (field name, is a radio group)`.
 pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
     // Each field is read once: a field listed twice in `/Kids` (or among its own kids) would
-    // otherwise be walked again for every path to it, doubling the work at each level. `steps`
-    // counts every entry followed, so fields sharing one long `/Kids` array stay bounded too;
-    // `walk` returns false once it is spent, and every loop then stops.
+    // otherwise be walked again for every path to it, doubling the work at each level. Fields
+    // are told apart by object number, as `Document::get` finds them, so `5 0 R` and `5 1 R`
+    // are one. `steps` counts every entry looked at, references or not, so fields sharing one
+    // long `/Kids` array stay bounded too; `walk_all` returns false once it is spent, and every
+    // loop then stops.
     struct Walk {
         out: HashMap<String, String>,
-        seen: HashSet<pdfcraft_cos::ObjRef>,
+        seen: HashSet<u32>,
         steps: usize,
     }
+    fn walk_all(doc: &Document, kids: &[Object], prefix: &str, w: &mut Walk, depth: usize) -> bool {
+        kids.iter().all(|k| {
+            w.steps += 1;
+            if w.steps > MAX_FIELD_STEPS || w.out.len() > 100_000 {
+                return false;
+            }
+            k.as_ref().is_none_or(|r| walk(doc, r, prefix, w, depth))
+        })
+    }
     fn walk(doc: &Document, r: pdfcraft_cos::ObjRef, prefix: &str, w: &mut Walk, depth: usize) -> bool {
-        w.steps += 1;
-        if w.steps > MAX_FIELD_STEPS || w.out.len() > 100_000 {
-            return false;
-        }
-        if depth > MAX_DEPTH || !w.seen.insert(r) {
+        if depth > MAX_DEPTH || !w.seen.insert(r.num) {
             return true;
         }
         let o = doc.get(r);
@@ -577,12 +585,12 @@ pub fn fields_by_som(doc: &Document) -> HashMap<String, String> {
         }
         // Read in place: a copy of the array at every level would cost its length each time.
         let kids = d.get(b"Kids").map(|k| doc.resolve(k));
-        kids.as_deref().and_then(Object::as_array).into_iter().flatten().filter_map(Object::as_ref).all(|k| walk(doc, k, &name, w, depth + 1))
+        walk_all(doc, kids.as_deref().and_then(Object::as_array).map(Vec::as_slice).unwrap_or_default(), &name, w, depth + 1)
     }
     let Some((_, acro)) = acroform(doc) else { return HashMap::new() };
     let fields = acro.get(b"Fields").map(|f| doc.resolve(f));
     let mut w = Walk { out: HashMap::new(), seen: HashSet::new(), steps: 0 };
-    let _ = fields.as_deref().and_then(Object::as_array).into_iter().flatten().filter_map(Object::as_ref).all(|f| walk(doc, f, "", &mut w, 0));
+    walk_all(doc, fields.as_deref().and_then(Object::as_array).map(Vec::as_slice).unwrap_or_default(), "", &mut w, 0);
     w.out
 }
 
