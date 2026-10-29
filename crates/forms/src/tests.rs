@@ -3239,6 +3239,46 @@ fn a_direct_object_in_a_shared_kids_array_is_not_copied_for_every_node() {
     assert_eq!(document_scripts_named(&doc), [("init".to_string(), "var ready = true;".to_string())]);
 }
 
+#[test]
+fn a_name_tree_node_listed_under_many_generations_is_read_once() {
+    // `Document::get` finds a node by object number alone, so `4 0 R` and `4 1 R` are one node.
+    // The root lists one under 10,000 generations: read for each, it would list its script
+    // 10,000 times and use up the walk's 10,000 visits before the node listed after it.
+    let kids: Vec<String> = (0..10_000).map(|g| format!("4 {g} R")).collect();
+    let doc = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /Names << /JavaScript 3 0 R >> >>".into(),
+        "<< /Type /Pages /Kids [] /Count 0 >>".into(),
+        format!("<< /Kids [{} 5 0 R] >>", kids.join(" ")),
+        "<< /Names [(a) 6 0 R] >>".into(),
+        "<< /Names [(b) 6 0 R] >>".into(),
+        "<< /S /JavaScript /JS (var ready = true;) >>".into(),
+    ]);
+    let scripts = document_scripts_named(&doc);
+    assert_eq!(scripts.len(), 2, "{} scripts", scripts.len());
+    let js = "var ready = true;".to_string();
+    assert_eq!(scripts, [("a".to_string(), js.clone()), ("b".to_string(), js)]);
+}
+
+#[test]
+fn name_tree_nodes_sharing_one_names_array_list_its_scripts_once() {
+    // 9,999 nodes share one /Names array. Read for every node, its scripts would be listed 9,999
+    // times: ten million scripts and 1.3 GB when it names 1,000.
+    let nodes: Vec<String> = (0..9_999).map(|i| format!("{} 0 R", i + 6)).collect();
+    let mut objs = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Names << /JavaScript 3 0 R >> >>".to_string(),
+        "<< /Type /Pages /Kids [] /Count 0 >>".into(),
+        format!("<< /Kids [{}] >>", nodes.join(" ")),
+        "[(a) 5 0 R (b) 5 0 R]".into(),
+        "<< /S /JavaScript /JS (var ready = true;) >>".into(),
+    ];
+    objs.extend(nodes.iter().map(|_| "<< /Names 4 0 R >>".to_string()));
+    let doc = document(&objs);
+    let scripts = document_scripts_named(&doc);
+    assert_eq!(scripts.len(), 2, "{} scripts", scripts.len());
+    let js = "var ready = true;".to_string();
+    assert_eq!(scripts, [("a".to_string(), js.clone()), ("b".to_string(), js)]);
+}
+
 /// #3470: a form whose writer left the appearances to the viewer. Field A has an empty one,
 /// B none, C its own (`(old C)`), D is a combo without one, E a check box with states, F a list
 /// box without one, and G only a down appearance (`/D`, no `/N`).
